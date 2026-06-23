@@ -50,9 +50,7 @@ type CardData = {
 
 const sampleInputs = [
   "https://linear.app",
-  "AI lawyer for term sheets",
-  "Personal AI memory for laptop",
-  "Math game platform for kids",
+  "AI companion for startup founders",
 ];
 
 const loadingMessages = [
@@ -215,6 +213,7 @@ export default function Home() {
   const [copyLabel, setCopyLabel] = useState("Copy Result");
   const [threadLabel, setThreadLabel] = useState("Generate Thread");
   const [sourceNote, setSourceNote] = useState("");
+  const [showDeltaModal, setShowDeltaModal] = useState(false);
   const cardRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const detectedUrl = normalizePossibleUrl(input);
@@ -274,6 +273,9 @@ export default function Home() {
     setLoading(true);
     setAnalysis(null);
     setError("");
+    window.setTimeout(() => {
+      document.getElementById("result")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
 
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 45_000);
@@ -317,6 +319,9 @@ export default function Home() {
     setAnalysis(null);
     setError("");
     setSourceNote("");
+    window.setTimeout(() => {
+      document.getElementById("result")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
 
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 55_000);
@@ -407,7 +412,7 @@ export default function Home() {
     if (!analysis) return;
 
     const text = card
-      ? `${card.title}\n\n${card.body}\n\nAnalyze yours: ${APP_URL}`
+      ? `Delta Score: ${analysis.deltaScore}/10\n\n${card.eyebrow}\n${card.title}\n\n${card.body}\n\nAnalyze yours: ${APP_URL}`
       : buildThread(analysis);
 
     window.open(
@@ -441,9 +446,12 @@ export default function Home() {
           <span>DELTA_4</span>
           <span>ANALYZER</span>
         </div>
-        <a href={APP_URL} className="navCta">
-          delta4.vercel.app
-        </a>
+        <div className="navActions">
+          <button type="button" className="navCta" onClick={() => setShowDeltaModal(true)}>
+            ? Know about Delta 4
+          </button>
+          
+        </div>
       </nav>
 
       <section className="hero centeredHero">
@@ -462,6 +470,9 @@ export default function Home() {
           A mental model from Kunal Shah to evaluate whether your startup creates
           irreversible behaviour change — not just a slightly better product.
         </p>
+        <button type="button" className="learnButton" onClick={() => setShowDeltaModal(true)}>
+          ? Know about Delta 4
+        </button>
       </section>
 
       <section className="inputWrap" id="analyzer">
@@ -618,6 +629,72 @@ export default function Home() {
           </div>
         ) : null}
       </section>
+
+      {showDeltaModal ? (
+        <div className="modalOverlay" role="presentation" onClick={() => setShowDeltaModal(false)}>
+          <section
+            className="deltaModal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delta-modal-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modalTop">
+              <span>[framework]</span>
+              <button type="button" onClick={() => setShowDeltaModal(false)}>
+                Close
+              </button>
+            </div>
+            <h2 id="delta-modal-title">What is Delta 4?</h2>
+            <p>
+              Delta 4 is a mental model popularized by Kunal Shah for judging whether a
+              new product experience is meaningfully better than the old behavior.
+            </p>
+            <div className="formulaExplainer">
+              Delta = New experience score - Old experience score
+            </div>
+            <p>
+              If the difference is large enough, users do not merely try the product.
+              They change behavior. The old way starts feeling slow, clunky, expensive,
+              embarrassing, or outdated.
+            </p>
+            <div className="modalGrid">
+              <article>
+                <h3>Why 4 matters</h3>
+                <p>
+                  A small improvement creates curiosity. A Delta 4 improvement creates
+                  a new default: users struggle to go back.
+                </p>
+              </article>
+              <article>
+                <h3>What raises Delta</h3>
+                <p>
+                  Speed, lower effort, emotional pull, habit frequency, status,
+                  network effects, and low switching friction.
+                </p>
+              </article>
+              <article>
+                <h3>What lowers Delta</h3>
+                <p>
+                  Thin wrappers, discount-only behavior, unclear users, rare usage,
+                  and alternatives that are already good enough.
+                </p>
+              </article>
+              <article>
+                <h3>How to use the score</h3>
+                <p>
+                  Treat it as a product lens. Make the new behavior easier, more
+                  repeatable, and harder to abandon.
+                </p>
+              </article>
+            </div>
+            <p className="modalDisclaimer">
+              Unofficial explanation. Inspired by Kunal Shah&apos;s public Delta 4
+              mental model. Not affiliated with Kunal Shah or CRED.
+            </p>
+          </section>
+        </div>
+      ) : null}
 
       <footer>
         <div className="footerAttribution">
