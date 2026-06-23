@@ -1,111 +1,174 @@
 import * as cheerio from "cheerio";
+import { lookup } from "node:dns/promises";
+import { EXTRACTION_PROMPT, RETRY_PROMPT_SUFFIX } from "@/lib/server/prompts";
+import { callGeminiJson } from "@/lib/server/gemini";
+import { checkScrapeLimits } from "@/lib/server/rate-limit";
+import {
+  getClientIp,
+  hasSuspiciousPromptIntent,
+  isPrivateHostname,
+  isPrivateIp,
+  jsonError,
+  SAFE_ERROR,
+  safeLog,
+  sanitizeString,
+} from "@/lib/server/security";
 import { NextResponse } from "next/server";
 
-const FETCH_TIMEOUT_MS = 22_000;
-const GEMINI_TIMEOUT_MS = 45_000;
-const MAX_EXTRACTED_CHARS = 18_000;
+const FETCH_TIMEOUT_MS = 18_000;
+const GEMINI_TIMEOUT_MS = 35_000;
+const MAX_EXTRACTED_CHARS = 10_000;
 const MIN_READABLE_CHARS = 20;
+const MAX_URL_LENGTH = 300;
+const MAX_RESPONSE_BYTES = 1_500_000;
+const MAX_REDIRECTS = 3;
+
+export const runtime = "nodejs";
 
 type ExtractedFields = {
-  startupIdea?: string;
-  targetUser?: string;
-  currentAlternative?: string;
-  differentiation?: string;
-  pricingOrBusinessModel?: string;
-  confidence?: string;
-  missingInfo?: string[];
+  startupIdea: string;
+  targetUser: string;
+  currentAlternative: string;
+  differentiation: string;
+  pricingOrBusinessModel: string;
+  confidence: "High" | "Medium" | "Low";
+  missingInfo: string[];
 };
 
-const EXTRACTION_PROMPT = `You are analyzing a startup/product website.
-
-From the website text, infer the following fields for a Delta 4 startup analysis.
-
-Return only valid JSON:
-
-{
-  "startupIdea": "",
-  "targetUser": "",
-  "currentAlternative": "",
-  "differentiation": "",
-  "pricingOrBusinessModel": "",
-  "confidence": "High / Medium / Low",
-  "missingInfo": []
-}
-
-Rules:
-- Be specific.
-- Do not invent details not supported by the website.
-- If pricing is not mentioned, say "Not clear from website".
-- If current alternative is not directly mentioned, infer the most likely current alternative.
-- If confidence is low, explain missing info in missingInfo.
-- Keep each field concise but useful.`;
-
-function parseJsonOnly(text: string) {
-  const stripped = text
-    .trim()
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "");
-
-  try {
-    return JSON.parse(stripped);
-  } catch {
-    const start = stripped.indexOf("{");
-    const end = stripped.lastIndexOf("}");
-
-    if (start >= 0 && end > start) {
-      return JSON.parse(stripped.slice(start, end + 1));
-    }
-
-    throw new Error("INVALID_JSON");
-  }
+function compactText(value: string) {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function normalizeUrl(rawUrl: unknown) {
-  if (typeof rawUrl !== "string") return null;
+  if (typeof rawUrl !== "string" || rawUrl.length > MAX_URL_LENGTH) return null;
+  const raw = sanitizeString(rawUrl, MAX_URL_LENGTH);
+  if (!raw) return null;
 
-  const trimmed = rawUrl.trim();
-  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
 
   try {
     const url = new URL(withProtocol);
-
-    if (!["http:", "https:"].includes(url.protocol) || !url.hostname.includes(".")) {
-      return null;
-    }
-
-    return url.toString();
+    if (!["http:", "https:"].includes(url.protocol) || !url.hostname.includes(".")) return null;
+    url.hash = "";
+    return url;
   } catch {
     return null;
   }
 }
 
-function buildUrlCandidates(url: string) {
-  const parsed = new URL(url);
-  const withoutWww = parsed.hostname.replace(/^www\./i, "");
-  const hostnames = Array.from(new Set([parsed.hostname, `www.${withoutWww}`, withoutWww]));
-  const protocols = parsed.protocol === "http:" ? ["http:", "https:"] : ["https:", "http:"];
+async function assertPublicHttpUrl(url: URL) {
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("INVALID_URL");
+  if (isPrivateHostname(url.hostname)) throw new Error("INVALID_URL");
+
+  const records = await lookup(url.hostname, { all: true, verbatim: true }).catch(() => []);
+  if (records.length === 0) throw new Error("INVALID_URL");
+  if (records.some((record) => isPrivateIp(record.address))) throw new Error("INVALID_URL");
+}
+
+function buildUrlCandidates(url: URL) {
+  const withoutWww = url.hostname.replace(/^www\./i, "");
+  const hostnames = Array.from(new Set([url.hostname, `www.${withoutWww}`, withoutWww]));
+  const protocols = url.protocol === "http:" ? ["http:", "https:"] : ["https:", "http:"];
 
   return Array.from(
     new Set(
       protocols.flatMap((protocol) =>
         hostnames.map((hostname) => {
-          const candidate = new URL(parsed.toString());
+          const candidate = new URL(url.toString());
           candidate.protocol = protocol;
           candidate.hostname = hostname;
-          return candidate.toString();
+          return candidate;
         }),
       ),
     ),
   );
 }
 
-function compactText(value: string) {
-  return value.replace(/\s+/g, " ").trim();
+async function readLimitedText(response: Response) {
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (contentLength > MAX_RESPONSE_BYTES) throw new Error("TOO_LARGE");
+
+  const reader = response.body?.getReader();
+  if (!reader) return response.text();
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+
+    total += value.byteLength;
+    if (total > MAX_RESPONSE_BYTES) throw new Error("TOO_LARGE");
+    chunks.push(value);
+  }
+
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+async function fetchHtmlSafely(initialUrl: URL) {
+  let current = initialUrl;
+
+  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+    await assertPublicHttpUrl(current);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(current, {
+        signal: controller.signal,
+        redirect: "manual",
+        headers: {
+          accept: "text/html,application/xhtml+xml",
+          "user-agent":
+            "Mozilla/5.0 (compatible; Delta4Analyzer/1.0; +https://delta4.vercel.app)",
+        },
+      });
+
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get("location");
+        if (!location) throw new Error("UNREACHABLE");
+        current = new URL(location, current);
+        continue;
+      }
+
+      if (!response.ok) throw new Error("UNREACHABLE");
+
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.toLowerCase().includes("text/html")) throw new Error("UNREACHABLE");
+
+      return { html: await readLimitedText(response), finalUrl: current };
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") throw new Error("TIMEOUT");
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw new Error("UNREACHABLE");
+}
+
+async function fetchFirstReachable(url: URL) {
+  let timedOut = false;
+
+  for (const candidate of buildUrlCandidates(url)) {
+    try {
+      return await fetchHtmlSafely(candidate);
+    } catch (error) {
+      if (error instanceof Error && error.message === "TIMEOUT") timedOut = true;
+      if (error instanceof Error && error.message === "INVALID_URL") throw error;
+    }
+  }
+
+  throw new Error(timedOut ? "TIMEOUT" : "UNREACHABLE");
 }
 
 function extractText(html: string) {
-  const $ = cheerio.load(html);
+  const withoutComments = html.replace(/<!--[\s\S]*?-->/g, "");
+  const $ = cheerio.load(withoutComments);
 
   const title = compactText($("title").first().text());
   const description = compactText(
@@ -119,7 +182,6 @@ function extractText(html: string) {
       $("meta[name='twitter:title']").attr("content") ||
       "",
   );
-  const keywords = compactText($("meta[name='keywords']").attr("content") || "");
 
   $(
     [
@@ -130,9 +192,20 @@ function extractText(html: string) {
       "img",
       "video",
       "iframe",
+      "form",
+      "input",
+      "textarea",
+      "select",
+      "option",
       "nav",
       "footer",
       "header",
+      "[hidden]",
+      "[aria-hidden='true']",
+      "[style*='display:none' i]",
+      "[style*='display: none' i]",
+      "[style*='visibility:hidden' i]",
+      "[style*='visibility: hidden' i]",
       "[class*='cookie' i]",
       "[id*='cookie' i]",
       "[class*='banner' i]",
@@ -145,165 +218,114 @@ function extractText(html: string) {
   ).remove();
 
   const chunks: string[] = [];
-
   if (title) chunks.push(`Title: ${title}`);
   if (ogTitle && ogTitle !== title) chunks.push(`Social title: ${ogTitle}`);
   if (description) chunks.push(`Meta description: ${description}`);
-  if (keywords) chunks.push(`Keywords: ${keywords}`);
 
   $("h1, h2, h3, p, button, a, li, dt, dd, summary, [class*='price' i], [id*='price' i], [class*='faq' i], [id*='faq' i]")
     .each((_, element) => {
       const text = compactText($(element).text());
-
-      if (text && text.length >= 3 && text.length <= 600) {
-        chunks.push(text);
-      }
+      if (text && text.length >= 3 && text.length <= 600) chunks.push(text);
     });
 
   return Array.from(new Set(chunks)).join("\n").slice(0, MAX_EXTRACTED_CHARS);
 }
 
-function fallbackFieldsFromText(url: string, text: string): ExtractedFields {
+function asString(value: unknown, maxLength = 500) {
+  return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+}
+
+function validateExtractedFields(raw: any): ExtractedFields {
+  if (!raw || typeof raw !== "object") throw new Error("INVALID_SCHEMA");
+
+  const confidence = asString(raw.confidence, 20);
+  const fields: ExtractedFields = {
+    startupIdea: asString(raw.startupIdea),
+    targetUser: asString(raw.targetUser),
+    currentAlternative: asString(raw.currentAlternative),
+    differentiation: asString(raw.differentiation),
+    pricingOrBusinessModel: asString(raw.pricingOrBusinessModel),
+    confidence: confidence === "High" || confidence === "Medium" ? confidence : "Low",
+    missingInfo: Array.isArray(raw.missingInfo)
+      ? raw.missingInfo.map((item: unknown) => asString(item, 160)).filter(Boolean).slice(0, 5)
+      : [],
+  };
+
+  if (!fields.startupIdea || !fields.targetUser || !fields.currentAlternative) {
+    throw new Error("INVALID_SCHEMA");
+  }
+
+  return fields;
+}
+
+function fallbackFieldsFromText(url: URL, text: string): ExtractedFields {
   const lines = text
     .split("\n")
-    .map((line) => line.replace(/^(Title|Social title|Meta description|Keywords):\s*/i, "").trim())
+    .map((line) => line.replace(/^(Title|Social title|Meta description):\s*/i, "").trim())
     .filter(Boolean);
-  const title = lines[0] || new URL(url).hostname.replace(/^www\./, "");
+  const title = lines[0] || url.hostname.replace(/^www\./, "");
   const description = lines.slice(1, 4).join(" ").slice(0, 260) || title;
 
   return {
-    startupIdea: `${title}: ${description}`.slice(0, 320),
+    startupIdea: `${title}: ${description}`.slice(0, 500),
     targetUser: "People or teams looking for the product described on this landing page",
-    currentAlternative: "Existing incumbent tools, manual workflows, agencies, spreadsheets, or doing nothing",
+    currentAlternative: "Existing incumbent tools, manual workflows, spreadsheets, agencies, or doing nothing",
     differentiation: description,
     pricingOrBusinessModel: /pricing|price|\$|month|year|free|plan/i.test(text)
       ? "Pricing signals are present on the website, but exact model is unclear"
       : "Not clear from website",
     confidence: "Low",
-    missingInfo: [
-      "Website copy was sparse or hard to extract, so fields were inferred from visible metadata.",
-    ],
+    missingInfo: ["Website copy was sparse, so fields were inferred from visible metadata."],
   };
 }
 
-function getOutputText(payload: any) {
-  return (
-    payload?.output_text ||
-    payload?.steps?.at?.(-1)?.content?.find?.((item: any) => item?.type === "text")?.text ||
-    ""
-  );
-}
+async function extractWithGemini(apiKey: string, url: URL, text: string) {
+  const input = `Website URL: ${url.toString()}
 
-async function fetchWithTimeout(url: string) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+Untrusted website text:
+${text}
+
+Return JSON only.`;
 
   try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        accept: "text/html,application/xhtml+xml",
-        "user-agent":
-          "Mozilla/5.0 (compatible; Delta4Analyzer/1.0; +https://delta4.analyzer)",
-      },
-    });
-
-    if (!response.ok) throw new Error("UNREACHABLE");
-
-    const contentType = response.headers.get("content-type") || "";
-    if (!contentType.includes("text/html")) throw new Error("UNREACHABLE");
-
-    return response.text();
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("TIMEOUT");
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function fetchFirstReachable(url: string) {
-  let timedOut = false;
-
-  for (const candidate of buildUrlCandidates(url)) {
-    try {
-      return { html: await fetchWithTimeout(candidate), finalUrl: candidate };
-    } catch (error) {
-      if (error instanceof Error && error.message === "TIMEOUT") {
-        timedOut = true;
-      }
-    }
-  }
-
-  throw new Error(timedOut ? "TIMEOUT" : "UNREACHABLE");
-}
-
-async function extractWithGemini(apiKey: string, url: string, text: string) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
-
-  try {
-    const response = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
-      body: JSON.stringify({
-        model: process.env.GEMINI_MODEL || "gemini-3.5-flash",
-        system_instruction: EXTRACTION_PROMPT,
-        input: `Website URL: ${url}\n\nWebsite text:\n${text}\n\nReturn JSON only.`,
-        generation_config: {
-          temperature: 0.2,
-          thinking_level: "low",
-        },
+    return validateExtractedFields(
+      await callGeminiJson({
+        apiKey,
+        systemInstruction: EXTRACTION_PROMPT,
+        input,
+        timeoutMs: GEMINI_TIMEOUT_MS,
+        temperature: 0.2,
       }),
-    });
-
-    if (!response.ok) throw new Error("EXTRACTION_FAILED");
-
-    const payload = await response.json().catch(() => null);
-    const outputText = getOutputText(payload);
-
-    if (!outputText) throw new Error("EXTRACTION_FAILED");
-
-    return parseJsonOnly(outputText);
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("TIMEOUT");
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timeout);
+    );
+  } catch (firstError) {
+    safeLog("scrape", firstError instanceof Error ? firstError.message : "first extraction failed");
+    return validateExtractedFields(
+      await callGeminiJson({
+        apiKey,
+        systemInstruction: `${EXTRACTION_PROMPT}\n\n${RETRY_PROMPT_SUFFIX}`,
+        input,
+        timeoutMs: GEMINI_TIMEOUT_MS,
+        temperature: 0.1,
+      }),
+    );
   }
 }
 
 export async function POST(request: Request) {
-  try {
-    const apiKey = process.env.GEMINI_API_KEY;
+  const ip = getClientIp(request);
 
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: "Couldn't understand this website clearly. Try manual mode." },
-        { status: 500 },
-      );
-    }
+  try {
+    if (!checkScrapeLimits(ip)) return jsonError(SAFE_ERROR.tooMany, 429);
+
+    const contentLength = Number(request.headers.get("content-length") || 0);
+    if (contentLength > 1_000) return jsonError(SAFE_ERROR.url, 413);
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) return jsonError(SAFE_ERROR.scrape, 500);
 
     const body = await request.json().catch(() => ({}));
     const url = normalizeUrl(body?.url);
-
-    if (!url) {
-      return NextResponse.json(
-        { error: "Please enter a valid website URL." },
-        { status: 400 },
-      );
-    }
+    if (!url) return jsonError(SAFE_ERROR.url, 400);
 
     let html = "";
     let finalUrl = url;
@@ -313,55 +335,40 @@ export async function POST(request: Request) {
       html = fetched.html;
       finalUrl = fetched.finalUrl;
     } catch (error) {
-      const message =
-        error instanceof Error && error.message === "TIMEOUT"
-          ? "The website took too long to respond. Try again or enter manually."
-          : "Couldn't access this website. Try another URL or enter manually.";
-
-      return NextResponse.json({ error: message }, { status: 502 });
+      safeLog("scrape", error instanceof Error ? error.message : "fetch failed");
+      if (error instanceof Error && error.message === "TIMEOUT") return jsonError(SAFE_ERROR.timeout, 502);
+      return jsonError(SAFE_ERROR.unreachable, 502);
     }
 
     const extractedText = extractText(html);
+    if (hasSuspiciousPromptIntent(extractedText)) return jsonError(SAFE_ERROR.suspicious, 400);
 
     if (extractedText.length < MIN_READABLE_CHARS) {
-      return NextResponse.json(
-        { error: "This website doesn't expose enough text to analyze. Try manual mode." },
-        { status: 422 },
-      );
+      return jsonError(SAFE_ERROR.littleText, 422);
     }
+
+    let fields: ExtractedFields;
 
     try {
-      const fields = await extractWithGemini(apiKey, finalUrl, extractedText);
-      return NextResponse.json({
-        fields: {
-          idea: fields.startupIdea || "",
-          targetUser: fields.targetUser || "",
-          currentAlternative: fields.currentAlternative || "",
-          differentiator: fields.differentiation || "",
-          pricing: fields.pricingOrBusinessModel || "",
-        },
-        confidence: fields.confidence || "Low",
-        missingInfo: Array.isArray(fields.missingInfo) ? fields.missingInfo : [],
-      });
+      fields = await extractWithGemini(apiKey, finalUrl, extractedText);
     } catch (error) {
-      const fallbackFields = fallbackFieldsFromText(finalUrl, extractedText);
-
-      return NextResponse.json({
-        fields: {
-          idea: fallbackFields.startupIdea || "",
-          targetUser: fallbackFields.targetUser || "",
-          currentAlternative: fallbackFields.currentAlternative || "",
-          differentiator: fallbackFields.differentiation || "",
-          pricing: fallbackFields.pricingOrBusinessModel || "",
-        },
-        confidence: fallbackFields.confidence || "Low",
-        missingInfo: fallbackFields.missingInfo || [],
-      });
+      safeLog("scrape", error instanceof Error ? error.message : "extraction failed");
+      fields = fallbackFieldsFromText(finalUrl, extractedText);
     }
-  } catch {
-    return NextResponse.json(
-      { error: "Couldn't understand this website clearly. Try manual mode." },
-      { status: 500 },
-    );
+
+    return NextResponse.json({
+      fields: {
+        idea: fields.startupIdea,
+        targetUser: fields.targetUser,
+        currentAlternative: fields.currentAlternative,
+        differentiator: fields.differentiation,
+        pricing: fields.pricingOrBusinessModel,
+      },
+      confidence: fields.confidence,
+      missingInfo: fields.missingInfo,
+    });
+  } catch (error) {
+    safeLog("scrape", error instanceof Error ? error.message : "unknown failure");
+    return jsonError(SAFE_ERROR.scrape, 500);
   }
 }
