@@ -8,17 +8,10 @@ type AnalyzePayload = {
   pricing?: string;
 };
 
-const requiredFields: Array<keyof AnalyzePayload> = [
-  "idea",
-  "targetUser",
-  "currentAlternative",
-  "differentiator",
-];
-
-const MIN_FIELD_LENGTH = 10;
+const MIN_IDEA_LENGTH = 12;
 const GEMINI_TIMEOUT_MS = 35_000;
 
-const SYSTEM_PROMPT = `You are a sharp founder-facing startup analyst trained on Kunal Shah's Delta 4 framework.
+const SYSTEM_PROMPT = `You are an experienced startup investor and product thinker trained on Kunal Shah's Delta 4 framework.
 
 Analyze the user's startup idea based on:
 - Old behavior
@@ -33,11 +26,15 @@ Analyze the user's startup idea based on:
 - Whether users would go back to the old way
 
 Tone:
-- Honest, punchy, slightly harsh.
+- Honest, punchy, founder-friendly, and optimistic about plausible behavior change.
+- Identify strengths first. Then explain what prevents an even higher score.
 - Avoid generic startup advice.
 - Call out fake convenience, discount-led behavior, AI-wrapper weakness, low switching pain, lack of brag-worthiness, and existing alternatives being good enough.
-- Do not hype weak ideas.
+- Do not hype truly weak ideas, but do not sandbag promising ideas. Your default should be to find the strongest credible wedge.
 - Use crisp founder-facing language that fits in a shareable screenshot.
+- Make the result feel useful and postable on X: memorable takeaway, sharper upside, and a clear next move.
+- Avoid roast energy. People should leave motivated, not dismissed.
+- Prefer tweet-worthy sentences. Example: "The workflow is the innovation, not the feature."
 
 Return only valid JSON in this exact format:
 
@@ -88,8 +85,15 @@ Scoring rules:
 - If deltaScore >= 4, verdictLabel should be "Delta 4".
 - If deltaScore is 3 to 3.9, verdictLabel should be "Borderline".
 - If deltaScore < 3, verdictLabel should be "Not Delta 4".
-- Do not give Delta 4 easily.
-- Discounts, cashback, AI-wrapper features, and convenience-only ideas should usually score lower unless behavior change is very strong.`;
+- Delta 4 is upper-middle, not impossible perfection.
+- Target distribution: 15% score 2-3, 30% score 4-5, 35% score 6-7, 15% score 8, 5% score 9+.
+- Most genuinely interesting startup ideas should score between 6 and 8.
+- Only truly weak ideas should receive below 4.
+- Only exceptional ideas should receive 9 or above.
+- Reward strong insight, clear differentiation, behavior change, better UX, network effects, AI leverage, distribution advantage, and traction inferred from website quality.
+- Avoid punishing ideas simply because they use AI.
+- Give Not Delta 4 only when the idea is mostly discount-led, a thin wrapper with no workflow change, low-frequency, or the old behavior is already excellent.
+- Discounts, cashback, and convenience-only ideas can still score well if the behavior change loop is strong.`;
 
 function cleanText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
@@ -121,10 +125,26 @@ function normalizeVerdict(result: any) {
   const newScore = Number(result?.newBehavior?.scoreOutOf10);
 
   if (Number.isFinite(oldScore) && Number.isFinite(newScore)) {
-    const deltaScore = Number((newScore - oldScore).toFixed(1));
-    result.deltaScore = deltaScore;
+    let adjustedNewScore = newScore;
+    let deltaScore = newScore - oldScore;
+
+    // Shareability calibration: promising ideas should cluster in the 6-8 range
+    // unless the model clearly sees a weak/low-switching-pain product.
+    if (newScore >= 6.2 && deltaScore >= 2.2 && deltaScore < 4) {
+      deltaScore = Math.min(6.8, Math.max(4.2, deltaScore + 1.6));
+      adjustedNewScore = Math.min(10, Number((oldScore + deltaScore).toFixed(1)));
+    } else if (newScore >= 7 && deltaScore >= 4) {
+      deltaScore = Math.min(8.2, deltaScore + 0.8);
+      adjustedNewScore = Math.min(10, Number((oldScore + deltaScore).toFixed(1)));
+    } else if (newScore >= 8.4 && deltaScore >= 5.5) {
+      deltaScore = Math.min(9.1, deltaScore + 0.5);
+      adjustedNewScore = Math.min(10, Number((oldScore + deltaScore).toFixed(1)));
+    }
+
+    result.newBehavior.scoreOutOf10 = adjustedNewScore;
+    result.deltaScore = Number((adjustedNewScore - oldScore).toFixed(1));
     result.verdictLabel =
-      deltaScore >= 4 ? "Delta 4" : deltaScore >= 3 ? "Borderline" : "Not Delta 4";
+      result.deltaScore >= 4 ? "Delta 4" : result.deltaScore >= 3 ? "Borderline" : "Not Delta 4";
   }
 
   if (typeof result?.oneLineTakeaway === "string") {
@@ -163,7 +183,7 @@ async function callGemini({
         "x-goog-api-key": apiKey,
       },
       body: JSON.stringify({
-        model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+        model: process.env.GEMINI_MODEL || "gemini-3.1-flash-lite",
         system_instruction: strictRetry
           ? `${SYSTEM_PROMPT}\n\nSTRICT RETRY: Your previous response was invalid. Return raw JSON only. No markdown, no prose, no code fence.`
           : SYSTEM_PROMPT,
@@ -204,38 +224,40 @@ export async function POST(request: Request) {
     }
 
     const body = (await request.json()) as AnalyzePayload;
-    const missingFields = requiredFields.filter((field) => !cleanText(body[field]));
+    const idea = cleanText(body.idea);
 
-    if (missingFields.length > 0) {
-      return NextResponse.json(
-        { error: "Fill the required fields before analyzing.", fields: missingFields },
-        { status: 400 },
-      );
-    }
-
-    const shortFields = requiredFields.filter(
-      (field) => cleanText(body[field]).length < MIN_FIELD_LENGTH,
-    );
-
-    if (shortFields.length > 0) {
+    if (idea.length < MIN_IDEA_LENGTH) {
       return NextResponse.json(
         {
           error: "Give us a little more context so the analysis is useful.",
-          fields: shortFields,
+          fields: ["idea"],
         },
         { status: 400 },
       );
     }
 
-    const userInput = `Analyze this startup/product idea using Delta 4.
+    const hasStructuredContext =
+      cleanText(body.targetUser) ||
+      cleanText(body.currentAlternative) ||
+      cleanText(body.differentiator) ||
+      cleanText(body.pricing);
 
-Startup idea: ${cleanText(body.idea)}
+    const userInput = hasStructuredContext
+      ? `Analyze this startup/product idea using Delta 4.
+
+Startup idea: ${idea}
 Target user: ${cleanText(body.targetUser)}
-Current alternative users use today: ${cleanText(body.currentAlternative)}
+Current alternative users use today: ${cleanText(body.currentAlternative) || "Infer from the idea"}
 What the product does differently: ${cleanText(body.differentiator)}
 Pricing / business model: ${cleanText(body.pricing) || "Not provided"}
 
-Return JSON only.`;
+Return JSON only.`
+      : `Analyze this startup/product idea using Delta 4.
+
+User entered only this idea:
+${idea}
+
+Infer the target user, old behavior/current alternative, new behavior, differentiation, pricing assumptions, and switching dynamics from the idea. If something is unclear, state the assumption in the analysis. Return JSON only.`;
 
     try {
       const firstResult = await callGemini({ apiKey, input: userInput, strictRetry: false });

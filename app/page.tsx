@@ -1,98 +1,131 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
+
+const APP_URL = "https://delta4.vercel.app";
+const KUNAL_SHAH_IMAGE = "/images/kunalshah.jpeg";
 
 type DeltaAnalysis = {
-  ideaSummary: string;
-  oldBehavior: {
-    description: string;
-    scoreOutOf10: number;
-    why: string;
-  };
-  newBehavior: {
-    description: string;
-    scoreOutOf10: number;
-    why: string;
-  };
+  oldBehavior: { description: string; scoreOutOf10: number; why: string };
+  newBehavior: { description: string; scoreOutOf10: number; why: string };
   deltaScore: number;
   verdict: string;
   verdictLabel: "Delta 4" | "Not Delta 4" | "Borderline" | string;
   behaviorChange: string;
   wouldUsersGoBack: string;
-  ubp: {
-    scoreOutOf10: number;
-    analysis: string;
-  };
+  ubp: { scoreOutOf10: number; analysis: string };
   risks: string[];
   whatMakesItWeak: string[];
   howToIncreaseDelta: string[];
   oneLineTakeaway: string;
 };
 
-type FormState = {
+type AnalyzePayload = {
   idea: string;
-  targetUser: string;
-  currentAlternative: string;
-  differentiator: string;
-  pricing: string;
+  targetUser?: string;
+  currentAlternative?: string;
+  differentiator?: string;
+  pricing?: string;
 };
 
-const initialForm: FormState = {
-  idea: "",
-  targetUser: "",
-  currentAlternative: "",
-  differentiator: "",
-  pricing: "",
+type ScrapeResult = {
+  fields: {
+    idea: string;
+    targetUser: string;
+    currentAlternative: string;
+    differentiator: string;
+    pricing: string;
+  };
+  confidence?: string;
 };
 
-const requiredFields: Array<keyof FormState> = [
-  "idea",
-  "targetUser",
-  "currentAlternative",
-  "differentiator",
-];
-
-const fieldLabels: Record<keyof FormState, string> = {
-  idea: "Startup idea",
-  targetUser: "Target user",
-  currentAlternative: "Current alternative users use today",
-  differentiator: "What your product does differently",
-  pricing: "Optional: pricing / business model",
+type CardData = {
+  id: string;
+  eyebrow: string;
+  title: string;
+  body: string;
+  footer?: string;
+  score?: string;
 };
 
-const sampleIdeas = [
+const sampleInputs = [
+  "https://linear.app",
   "AI lawyer for term sheets",
-  "Math game platform for kids",
   "Personal AI memory for laptop",
-  "Discount coupon marketplace",
+  "Math game platform for kids",
 ];
 
 const loadingMessages = [
-  "Comparing old behavior vs new behavior...",
-  "Checking if users would actually switch...",
-  "Looking for fake Delta created by discounts...",
-  "Testing brag-worthiness...",
+  "Reading your startup...",
+  "Understanding the current behaviour...",
+  "Finding the switching cost...",
+  "Estimating behavioural change...",
+  "Looking for network effects...",
+  "Evaluating brag-worthiness...",
+  "Thinking like Kunal Shah...",
+  "Calculating Delta...",
 ];
 
-function verdictClass(label: string) {
-  if (label === "Delta 4") return "verdictDelta";
-  if (label === "Borderline") return "verdictBorderline";
-  return "verdictNot";
-}
-
 function verdictText(label: string) {
-  if (label === "Delta 4") return "DELTA 4";
-  if (label === "Borderline") return "BORDERLINE";
-  return "NOT DELTA 4";
+  if (label === "Delta 4") return "Excellent";
+  if (label === "Borderline") return "Promising";
+  return "Early";
 }
 
-function getShareUrl() {
-  if (typeof window === "undefined") return "";
-  return window.location.href.split("#")[0];
+function normalizePossibleUrl(rawInput: string) {
+  const trimmed = rawInput.trim();
+  const maybeUrl =
+    /^https?:\/\//i.test(trimmed) ||
+    /^www\./i.test(trimmed) ||
+    (/^[a-z0-9-]+(\.[a-z0-9-]+)+\/?/i.test(trimmed) && !trimmed.includes(" "));
+
+  if (!maybeUrl) return null;
+
+  try {
+    const url = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`);
+    if (!["http:", "https:"].includes(url.protocol) || !url.hostname.includes(".")) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
 }
 
-function buildCopyText(analysis: DeltaAnalysis, url: string) {
-  return `My idea scored ${analysis.deltaScore}/10 on Delta 4.
+function buildThread(analysis: DeltaAnalysis) {
+  return `I just ran my startup through the Delta 4 Analyzer.
+
+Score:
+
+${analysis.deltaScore}/10
+
+Here's why 👇
+
+1.
+
+Current behaviour:
+${analysis.oldBehavior.description}
+
+2.
+
+New behaviour:
+${analysis.newBehavior.description}
+
+3.
+
+Biggest strength:
+${analysis.behaviorChange}
+
+4.
+
+What would make it a 10/10:
+${analysis.howToIncreaseDelta[0] || "Make switching effortless and the new habit impossible to ignore."}
+
+Analyze yours:
+
+${APP_URL}`;
+}
+
+function buildCopyText(analysis: DeltaAnalysis) {
+  return `My startup scored ${analysis.deltaScore}/10 on Delta 4.
 
 Old behavior: ${analysis.oldBehavior.scoreOutOf10}/10
 New behavior: ${analysis.newBehavior.scoreOutOf10}/10
@@ -100,12 +133,64 @@ Verdict: ${analysis.verdictLabel}
 
 Takeaway: ${analysis.oneLineTakeaway}
 
-Analyze yours: ${url}`;
+Analyze yours: ${APP_URL}`;
+}
+
+function buildCards(analysis: DeltaAnalysis): CardData[] {
+  return [
+    {
+      id: "score",
+      eyebrow: "DELTA SCORE",
+      title: verdictText(analysis.verdictLabel),
+      score: String(analysis.deltaScore),
+      body: analysis.oneLineTakeaway || "This has the shape of behavior change.",
+      footer: "Inspired by Kunal Shah's Delta 4 Framework",
+    },
+    {
+      id: "behavior",
+      eyebrow: "OLD VS NEW BEHAVIOUR",
+      title: `${analysis.oldBehavior.scoreOutOf10}/10 → ${analysis.newBehavior.scoreOutOf10}/10`,
+      body: `${analysis.oldBehavior.description} → ${analysis.newBehavior.description}`,
+      footer: "The gap is the product.",
+    },
+    {
+      id: "works",
+      eyebrow: "WHY THIS WORKS",
+      title: "The switching story",
+      body: analysis.behaviorChange || analysis.verdict,
+      footer: analysis.wouldUsersGoBack,
+    },
+    {
+      id: "opportunity",
+      eyebrow: "BIGGEST OPPORTUNITY",
+      title: "Make it a habit",
+      body:
+        analysis.howToIncreaseDelta[0] ||
+        "Make switching feel instant, repeated, and socially obvious.",
+      footer: "Good startup. Better habit loop.",
+    },
+    {
+      id: "risks",
+      eyebrow: "RISKS",
+      title: "What could cap the score",
+      body: analysis.risks[0] || "The old workflow may still feel good enough.",
+      footer: analysis.risks[1] || "Reduce switching friction.",
+    },
+    {
+      id: "ten",
+      eyebrow: "HOW TO REACH 10/10",
+      title: "Push the Delta",
+      body:
+        analysis.howToIncreaseDelta[1] ||
+        analysis.howToIncreaseDelta[0] ||
+        "Own the workflow, not just the feature.",
+      footer: "The workflow is the innovation.",
+    },
+  ];
 }
 
 function ListBlock({ title, items }: { title: string; items: string[] }) {
   const cleanItems = items.filter(Boolean);
-
   if (cleanItems.length === 0) return null;
 
   return (
@@ -121,21 +206,19 @@ function ListBlock({ title, items }: { title: string; items: string[] }) {
 }
 
 export default function Home() {
-  const [form, setForm] = useState<FormState>(initialForm);
+  const [input, setInput] = useState("");
   const [analysis, setAnalysis] = useState<DeltaAnalysis | null>(null);
+  const [lastPayload, setLastPayload] = useState<AnalyzePayload | null>(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [touched, setTouched] = useState(false);
-  const [invalidFields, setInvalidFields] = useState<Array<keyof FormState>>([]);
   const [loadingIndex, setLoadingIndex] = useState(0);
+  const [error, setError] = useState("");
   const [copyLabel, setCopyLabel] = useState("Copy Result");
-  const [downloadLabel, setDownloadLabel] = useState("Download Screenshot");
-  const resultCardRef = useRef<HTMLDivElement>(null);
+  const [threadLabel, setThreadLabel] = useState("Generate Thread");
+  const [sourceNote, setSourceNote] = useState("");
+  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
-  const missingFields = useMemo(
-    () => requiredFields.filter((field) => !form[field].trim()),
-    [form],
-  );
+  const detectedUrl = normalizePossibleUrl(input);
+  const cards = analysis ? buildCards(analysis) : [];
 
   useEffect(() => {
     if (!loading) {
@@ -145,36 +228,52 @@ export default function Home() {
 
     const interval = window.setInterval(() => {
       setLoadingIndex((current) => (current + 1) % loadingMessages.length);
-    }, 1600);
+    }, 1400);
 
     return () => window.clearInterval(interval);
   }, [loading]);
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function renderCard(cardId: string) {
+    const element = cardRefs.current[cardId];
+    if (!element) return null;
 
-    if (loading) return;
+    const html2canvas = (await import("html2canvas")).default;
+    return html2canvas(element, {
+      backgroundColor: "#080808",
+      scale: 2,
+      useCORS: true,
+    });
+  }
 
-    setTouched(true);
-    setError("");
-    setInvalidFields([]);
+  async function downloadCard(cardId: string) {
+    const canvas = await renderCard(cardId);
+    if (!canvas) return;
 
-    if (missingFields.length > 0) {
-      setInvalidFields(missingFields);
-      setError("Fill the required fields before analyzing.");
-      return;
-    }
+    const link = document.createElement("a");
+    link.download = `delta4-${cardId}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  }
 
-    const shortFields = requiredFields.filter((field) => form[field].trim().length < 10);
+  async function copyCardImage(cardId: string) {
+    const canvas = await renderCard(cardId);
+    if (!canvas || !navigator.clipboard || !("ClipboardItem" in window)) return;
 
-    if (shortFields.length > 0) {
-      setInvalidFields(shortFields);
+    const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+    if (!blob) return;
+
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+  }
+
+  async function runAnalysis(payload: AnalyzePayload, mode: "analysis" | "website" = "analysis") {
+    if (payload.idea.trim().length < 12) {
       setError("Give us a little more context so the analysis is useful.");
-      return;
+      return false;
     }
 
     setLoading(true);
     setAnalysis(null);
+    setError("");
 
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 45_000);
@@ -183,24 +282,21 @@ export default function Home() {
       const response = await fetch("/api/analyze", {
         method: "POST",
         signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(form),
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       });
-
-      const payload = await response.json().catch(() => ({}));
+      const body = await response.json().catch(() => ({}));
 
       if (!response.ok) {
-        setInvalidFields(payload?.fields || []);
-        console.log(payload)
-        throw new Error(payload?.error || "Couldn't analyze right now. Please try again.");
+        throw new Error(body?.error || "Couldn't analyze right now. Please try again.");
       }
 
-      setAnalysis(payload.analysis);
+      setLastPayload(payload);
+      setAnalysis(body.analysis);
       window.setTimeout(() => {
         document.getElementById("result")?.scrollIntoView({ behavior: "smooth", block: "start" });
       }, 100);
+      return true;
     } catch (submitError) {
       setError(
         submitError instanceof DOMException && submitError.name === "AbortError"
@@ -209,341 +305,334 @@ export default function Home() {
             ? submitError.message
             : "Couldn't analyze right now. Please try again.",
       );
+      return false;
     } finally {
       window.clearTimeout(timeout);
       setLoading(false);
     }
   }
 
-  function updateField(field: keyof FormState, value: string) {
-    setForm((current) => ({ ...current, [field]: value }));
-    setInvalidFields((current) => current.filter((item) => item !== field));
+  async function analyzeWebsite(url: string) {
+    setLoading(true);
+    setAnalysis(null);
+    setError("");
+    setSourceNote("");
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 55_000);
+
+    try {
+      const response = await fetch("/api/scrape", {
+        method: "POST",
+        signal: controller.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      const body = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(body?.error || "Couldn't understand this website clearly. Try describing the idea.");
+      }
+
+      const scrape = body as ScrapeResult;
+      const payload = {
+        idea: scrape.fields.idea,
+        targetUser: scrape.fields.targetUser,
+        currentAlternative: scrape.fields.currentAlternative,
+        differentiator: scrape.fields.differentiator,
+        pricing: scrape.fields.pricing,
+      };
+
+      setInput(scrape.fields.idea || url);
+      setSourceNote(
+        `Extracted from website${scrape.confidence ? ` (${scrape.confidence} confidence)` : ""}.`,
+      );
+
+      window.clearTimeout(timeout);
+      setLoading(false);
+      await runAnalysis(payload, "website");
+    } catch (scrapeError) {
+      setError(
+        scrapeError instanceof DOMException && scrapeError.name === "AbortError"
+          ? "The website took too long to respond. Try describing the idea instead."
+          : scrapeError instanceof Error
+            ? scrapeError.message
+            : "Couldn't understand this website clearly. Try describing the idea.",
+      );
+      setLoading(false);
+    } finally {
+      window.clearTimeout(timeout);
+    }
   }
 
-  function applySampleIdea(idea: string) {
-    setForm((current) => ({ ...current, idea }));
-    setInvalidFields((current) => current.filter((item) => item !== "idea"));
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (loading) return;
+
+    const trimmed = input.trim();
+    setError("");
+    setSourceNote("");
+
+    if (!trimmed) {
+      setError("Paste a website URL or describe your startup idea.");
+      return;
+    }
+
+    const url = normalizePossibleUrl(trimmed);
+    if (url) {
+      await analyzeWebsite(url);
+      return;
+    }
+
+    await runAnalysis({ idea: trimmed });
   }
 
   async function copyResult() {
     if (!analysis) return;
 
-    await navigator.clipboard.writeText(buildCopyText(analysis, getShareUrl()));
+    await navigator.clipboard.writeText(buildCopyText(analysis));
     setCopyLabel("Copied");
     window.setTimeout(() => setCopyLabel("Copy Result"), 1800);
   }
 
-  async function downloadScreenshot() {
-    if (!resultCardRef.current) return;
-
-    setDownloadLabel("Rendering...");
-
-    try {
-      const html2canvas = (await import("html2canvas")).default;
-      const canvas = await html2canvas(resultCardRef.current, {
-        backgroundColor: "#080808",
-        scale: 2,
-        useCORS: true,
-      });
-      const link = document.createElement("a");
-      link.download = "delta4-analysis.png";
-      link.href = canvas.toDataURL("image/png");
-      link.click();
-    } finally {
-      setDownloadLabel("Download Screenshot");
-    }
-  }
-
-  function shareOnX() {
+  async function copyThread() {
     if (!analysis) return;
 
-    const text = `My startup idea just got a Delta ${analysis.deltaScore} verdict.
-
-${analysis.oneLineTakeaway}
-
-Try yours: ${getShareUrl()}`;
-    const shareUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}`;
-    window.open(shareUrl, "_blank", "noopener,noreferrer");
+    await navigator.clipboard.writeText(buildThread(analysis));
+    setThreadLabel("Thread Copied");
+    window.setTimeout(() => setThreadLabel("Generate Thread"), 1800);
   }
 
-  function analyzeAnotherIdea() {
+  function shareOnX(card?: CardData) {
+    if (!analysis) return;
+
+    const text = card
+      ? `${card.title}\n\n${card.body}\n\nAnalyze yours: ${APP_URL}`
+      : buildThread(analysis);
+
+    window.open(
+      `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}`,
+      "_blank",
+      "noopener,noreferrer",
+    );
+  }
+
+  function resetForAnother() {
     setAnalysis(null);
     setError("");
-    setTouched(false);
-    setInvalidFields([]);
+    setSourceNote("");
     document.getElementById("analyzer")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  const cardBullets = analysis
-    ? [
-        {
-          label: analysis.deltaScore >= 3 ? "Why it works" : "Why it struggles",
-          text:
-            analysis.deltaScore >= 3
-              ? analysis.behaviorChange
-              : analysis.whatMakesItWeak[0] || analysis.verdict,
-        },
-        {
-          label: "Biggest risk",
-          text: analysis.risks[0] || "Existing alternatives may already be good enough.",
-        },
-        {
-          label: "Increase Delta",
-          text: analysis.howToIncreaseDelta[0] || "Raise switching pain and make the new behavior visibly better.",
-        },
-      ]
-    : [];
+  const showConfetti = !!analysis && analysis.deltaScore > 8;
 
   return (
     <main className="shell">
+      {showConfetti ? (
+        <div className="confetti" aria-hidden="true">
+          {Array.from({ length: 18 }).map((_, index) => (
+            <span key={index} style={{ "--i": index } as React.CSSProperties} />
+          ))}
+        </div>
+      ) : null}
+
       <nav className="nav" aria-label="Primary">
         <div className="brand" aria-label="Delta 4 Analyzer">
-          <span>DELTA 4</span>
+          <span>DELTA_4</span>
           <span>ANALYZER</span>
         </div>
-        <a href="#analyzer" className="navCta">
-          Run teardown
+        <a href={APP_URL} className="navCta">
+          delta4.vercel.app
         </a>
       </nav>
 
-      <section className="hero">
-        <div className="heroCopy">
-          <p className="eyebrow">Inspired by Kunal Shah&apos;s Delta 4 Framework</p>
-          <h1>Is your startup a Delta 4 idea?</h1>
-          <p className="subtitle">
-            Find out if your product is truly behavior-changing or just another
-            slightly-better startup idea.
-          </p>
+      <section className="hero centeredHero">
+        <div className="heroInspiration">
+          <img
+            src={KUNAL_SHAH_IMAGE}
+            alt="Kunal Shah"
+            className="kunalAvatar kunalAvatarLg"
+            width={72}
+            height={72}
+          />
+          <p className="eyebrow">Inspired by Kunal Shah&apos;s Delta 4 framework</p>
         </div>
-
-        <div className="formulaCard" aria-label="Delta 4 formula">
-          <div className="formulaHeader">
-            <span>DELTA MATH</span>
-            <span>OLD VS NEW</span>
-          </div>
-          <div className="formulaLine">Delta = New UX - Old UX</div>
-          <p>
-            If the gap is not painful, visible, and emotionally sticky, users drift
-            back to the old behavior.
-          </p>
-        </div>
+        <h1>Will your startup create Delta 4?</h1>
+        <p className="subtitle">
+          A mental model from Kunal Shah to evaluate whether your startup creates
+          irreversible behaviour change — not just a slightly better product.
+        </p>
       </section>
 
-      <section className="toolGrid" id="analyzer">
-        <form className="formPanel" onSubmit={handleSubmit}>
-          <div className="sectionHeader">
-            <span>STARTUP INPUT</span>
-            <h2>Founder teardown</h2>
-            <p>Be specific. Weak inputs get weak analysis.</p>
+      <section className="inputWrap" id="analyzer">
+        <form className="inputCard" onSubmit={handleSubmit}>
+          <div className="inputModes">
+            <div>
+              <span>🌐 Analyze Website</span>
+              <small>Paste your startup URL</small>
+            </div>
+            <b>OR</b>
+            <div>
+              <span>💡 Describe Your Idea</span>
+              <small>Write your startup idea manually</small>
+            </div>
           </div>
 
-          <div className="sampleChips" aria-label="Sample ideas">
-            {sampleIdeas.map((idea) => (
-              <button type="button" key={idea} onClick={() => applySampleIdea(idea)}>
-                {idea}
+          <textarea
+            value={input}
+            onChange={(event) => {
+              setInput(event.target.value);
+              setError("");
+              setSourceNote("");
+            }}
+            placeholder="https://example.com&#10;&#10;or&#10;&#10;AI tool that helps founders negotiate term sheets before they speak to counsel."
+            rows={8}
+            aria-invalid={!!error && !analysis}
+          />
+
+          {sourceNote ? <p className="extractedNotice">[+] {sourceNote}</p> : null}
+
+          <div className="sampleChips" aria-label="Sample inputs">
+            {sampleInputs.map((sample) => (
+              <button
+                type="button"
+                key={sample}
+                onClick={() => {
+                  setInput(sample);
+                  setError("");
+                  setSourceNote("");
+                }}
+              >
+                {sample}
               </button>
             ))}
           </div>
 
-          <label>
-            <span>{fieldLabels.idea}</span>
-            <textarea
-              value={form.idea}
-              onChange={(event) => updateField("idea", event.target.value)}
-              placeholder="Example: AI co-pilot that helps D2C founders plan weekly retention experiments."
-              rows={4}
-              aria-invalid={touched && (missingFields.includes("idea") || invalidFields.includes("idea"))}
-            />
-            {invalidFields.includes("idea") ? <small>Give this field more useful detail.</small> : null}
-          </label>
+          {error ? <p className="errorMessage">[-] {error}</p> : null}
 
-          <label>
-            <span>{fieldLabels.targetUser}</span>
-            <input
-              value={form.targetUser}
-              onChange={(event) => updateField("targetUser", event.target.value)}
-              placeholder="Example: Seed-stage D2C founders"
-              aria-invalid={
-                touched && (missingFields.includes("targetUser") || invalidFields.includes("targetUser"))
-              }
-            />
-            {invalidFields.includes("targetUser") ? <small>Be clear about the exact user.</small> : null}
-          </label>
-
-          <label>
-            <span>{fieldLabels.currentAlternative}</span>
-            <textarea
-              value={form.currentAlternative}
-              onChange={(event) => updateField("currentAlternative", event.target.value)}
-              placeholder="Example: Agencies, spreadsheets, generic analytics dashboards, founder intuition."
-              rows={3}
-              aria-invalid={
-                touched &&
-                (missingFields.includes("currentAlternative") ||
-                  invalidFields.includes("currentAlternative"))
-              }
-            />
-            {invalidFields.includes("currentAlternative") ? (
-              <small>Name what users actually do today.</small>
-            ) : null}
-          </label>
-
-          <label>
-            <span>{fieldLabels.differentiator}</span>
-            <textarea
-              value={form.differentiator}
-              onChange={(event) => updateField("differentiator", event.target.value)}
-              placeholder="Example: It turns live customer data into ranked experiments and writes the launch plan."
-              rows={3}
-              aria-invalid={
-                touched &&
-                (missingFields.includes("differentiator") || invalidFields.includes("differentiator"))
-              }
-            />
-            {invalidFields.includes("differentiator") ? (
-              <small>Say what changes behavior, not just what is convenient.</small>
-            ) : null}
-          </label>
-
-          <label>
-            <span>{fieldLabels.pricing}</span>
-            <input
-              value={form.pricing}
-              onChange={(event) => updateField("pricing", event.target.value)}
-              placeholder="Example: $199/month SaaS"
-            />
-          </label>
-
-          {error ? <p className="errorMessage">{error}</p> : null}
-
-          <button type="submit" disabled={loading}>
-            {loading ? loadingMessages[loadingIndex] : "Analyze Delta 4"}
+          <button type="submit" disabled={loading} className="analyzeButton">
+            {loading ? loadingMessages[loadingIndex] : "Analyze"}
           </button>
         </form>
+      </section>
 
-        <aside className="resultPanel" id="result" aria-live="polite">
-          {!analysis && !loading ? (
-            <div className="emptyState">
-              <span>RESULT PREVIEW</span>
-              <h2>Your share card will appear here.</h2>
-              <p>
-                The final result is designed to be screenshotable: score, verdict,
-                switching truth, and the sharpest next move.
-              </p>
+      <section className="resultArea" id="result" aria-live="polite">
+        {!analysis && !loading ? (
+          <div className="emptyState">
+            <span>[result]</span>
+            <h2>Your screenshot-ready cards will appear here.</h2>
+            <p>Score, behavior shift, biggest upside, and a ready-to-post thread.</p>
+          </div>
+        ) : null}
+
+        {loading ? (
+          <div className="loadingState skeletonPanel">
+            <img
+              src={KUNAL_SHAH_IMAGE}
+              alt=""
+              aria-hidden="true"
+              className={`kunalAvatar ${loadingMessages[loadingIndex].includes("Kunal Shah") ? "kunalAvatarPulse" : ""}`}
+              width={48}
+              height={48}
+            />
+            <span>[calculating_delta]</span>
+            <p>{loadingMessages[loadingIndex]}</p>
+            <div className="loadingBar" />
+          </div>
+        ) : null}
+
+        {analysis ? (
+          <div className="analysis">
+            <div className="topActions">
+              <button type="button" onClick={copyResult}>
+                {copyLabel}
+              </button>
+              <button type="button" onClick={copyThread}>
+                {threadLabel}
+              </button>
+              <button type="button" onClick={() => shareOnX()}>
+                Share Thread on X
+              </button>
+              <button type="button" className="secondaryButton" onClick={resetForAnother}>
+                Analyze another
+              </button>
             </div>
-          ) : null}
 
-          {loading ? (
-            <div className="loadingState">
-              <span>ANALYZING</span>
-              <p>{loadingMessages[loadingIndex]}</p>
-              <div className="loadingBar" />
+            <div className="cardGrid">
+              {cards.map((card) => (
+                <article key={card.id} className="shareCardShell">
+                  <div
+                    className={`postCard ${card.id === "score" ? "heroPostCard" : ""}`}
+                    ref={(element) => {
+                      cardRefs.current[card.id] = element;
+                    }}
+                  >
+                    <div className="postCardBrand">
+                      <span>{card.eyebrow}</span>
+                      <span>delta4.vercel.app</span>
+                    </div>
+
+                    {card.score ? <strong className="postScore">{card.score}</strong> : null}
+                    <h2>{card.title}</h2>
+                    <p>{card.body}</p>
+                    {card.footer ? (
+                      <small className={card.id === "score" ? "postCardAttribution" : ""}>
+                        {card.id === "score" ? (
+                          <>
+                            <img
+                              src={KUNAL_SHAH_IMAGE}
+                              alt=""
+                              aria-hidden="true"
+                              className="kunalAvatar kunalAvatarSm"
+                              width={24}
+                              height={24}
+                            />
+                            <span>{card.footer}</span>
+                          </>
+                        ) : (
+                          card.footer
+                        )}
+                      </small>
+                    ) : null}
+                  </div>
+
+                  <div className="cardActions">
+                    <button type="button" onClick={() => downloadCard(card.id)}>
+                      Download PNG
+                    </button>
+                    <button type="button" onClick={() => copyCardImage(card.id)}>
+                      Copy Image
+                    </button>
+                    <button type="button" onClick={() => shareOnX(card)}>
+                      Share to X
+                    </button>
+                  </div>
+                </article>
+              ))}
             </div>
-          ) : null}
 
-          {analysis ? (
-            <div className="analysis">
-              <div
-                className={`shareCard ${verdictClass(analysis.verdictLabel)}`}
-                ref={resultCardRef}
-              >
-                <div className="shareCardTop">
-                  <span>DELTA 4 ANALYZER</span>
-                  <strong>{verdictText(analysis.verdictLabel)}</strong>
-                </div>
-
-                <div className="scoreCenter">
-                  <span>DELTA SCORE</span>
-                  <strong>{analysis.deltaScore}</strong>
-                  <p>{analysis.oneLineTakeaway}</p>
-                </div>
-
-                <div className="scoreSplit">
-                  <div>
-                    <span>Old behavior</span>
-                    <strong>{analysis.oldBehavior.scoreOutOf10}/10</strong>
-                  </div>
-                  <div>
-                    <span>New behavior</span>
-                    <strong>{analysis.newBehavior.scoreOutOf10}/10</strong>
-                  </div>
-                </div>
-
-                <div className="goBack">
-                  <span>Would users go back?</span>
-                  <p>{analysis.wouldUsersGoBack}</p>
-                </div>
-
-                <ul className="cardBullets">
-                  {cardBullets.map((bullet) => (
-                    <li key={bullet.label}>
-                      <span>{bullet.label}</span>
-                      <p>{bullet.text}</p>
-                    </li>
-                  ))}
-                </ul>
-
-                <div className="shareCardFooter">
-                  <span>delta4.analyzer</span>
-                  <span>Inspired by Kunal Shah&apos;s Delta 4 framework</span>
-                </div>
-              </div>
-
-              <div className="actionRow">
-                <button type="button" onClick={copyResult}>
-                  {copyLabel}
-                </button>
-                <button type="button" onClick={downloadScreenshot}>
-                  {downloadLabel}
-                </button>
-                <button type="button" onClick={shareOnX}>
-                  Share on X
-                </button>
-                <button type="button" className="secondaryButton" onClick={analyzeAnotherIdea}>
-                  Analyze another idea
-                </button>
-              </div>
-
-              <section className="resultSection">
-                <h3>Verdict</h3>
-                <p>{analysis.verdict}</p>
-              </section>
-
-              <section className="comparisonGrid">
-                <article>
-                  <span>OLD</span>
-                  <h3>Old behavior</h3>
-                  <strong>{analysis.oldBehavior.scoreOutOf10}/10</strong>
-                  <p>{analysis.oldBehavior.description}</p>
-                  <small>{analysis.oldBehavior.why}</small>
-                </article>
-                <article>
-                  <span>NEW</span>
-                  <h3>New behavior</h3>
-                  <strong>{analysis.newBehavior.scoreOutOf10}/10</strong>
-                  <p>{analysis.newBehavior.description}</p>
-                  <small>{analysis.newBehavior.why}</small>
-                </article>
-              </section>
-
-              <section className="resultSection">
-                <h3>UBP / brag-worthiness</h3>
-                <p>
-                  <strong>{analysis.ubp.scoreOutOf10}/10</strong> {analysis.ubp.analysis}
-                </p>
-              </section>
-
+            <div className="reportGrid">
               <ListBlock title="Risks" items={analysis.risks} />
-              <ListBlock title="What makes it weak" items={analysis.whatMakesItWeak} />
-              <ListBlock title="How to increase Delta" items={analysis.howToIncreaseDelta} />
+              <ListBlock title="How to reach 10/10" items={analysis.howToIncreaseDelta} />
             </div>
-          ) : null}
-        </aside>
+          </div>
+        ) : null}
       </section>
 
       <footer>
-        Unofficial tool. Inspired by Kunal Shah&apos;s public Delta 4 mental model.
-        Not affiliated with Kunal Shah or CRED.
+        <div className="footerAttribution">
+          <img
+            src={KUNAL_SHAH_IMAGE}
+            alt="Kunal Shah"
+            className="kunalAvatar"
+            width={40}
+            height={40}
+          />
+          <p>
+            Unofficial tool inspired by Kunal Shah&apos;s public Delta 4 mental model.
+            Not affiliated with Kunal Shah or CRED.
+          </p>
+        </div>
       </footer>
     </main>
   );
